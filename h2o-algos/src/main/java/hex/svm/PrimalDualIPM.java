@@ -14,20 +14,22 @@ public class PrimalDualIPM {
     final double c_neg = params._weight_negative * params._hyper_parm;
     final long num_constraints = rbicf.numRows() * 2;
 
+    Frame volatileWorkspace = new Frame(new String[]{"z", "xi", "dxi", "la", "dla", "tlx", "tux", "xilx", "laux", "d", "dx"}, label.makeVolatileDoubles(11));
+
     Frame workspace = new Frame(new String[]{"label"}, new Vec[]{label});
     workspace.add("x", label.makeZero());
-    workspace.add(new String[]{"z", "xi", "dxi", "la", "dla", "tlx", "tux", "xilx", "laux", "d", "dx"}, label.makeVolatileDoubles(11));
+    workspace.add(volatileWorkspace);
 
     new InitTask(c_pos, c_neg).doAll(workspace);
 
     Vec z = workspace.vec("z");
     Vec la = workspace.vec("la");
     Vec xi = workspace.vec("xi");
-
     Vec x = workspace.vec("x");
     Vec dxi = workspace.vec("dxi");
     Vec dla = workspace.vec("dla");
     Vec d = workspace.vec("d");
+    Vec dx = workspace.vec("dx");
 
     double nu = 0;
     boolean converged = false;
@@ -49,9 +51,7 @@ public class PrimalDualIPM {
       LLMatrix lra = MatrixUtils.cf(icfA);
 
       final double dnu = computeDeltaNu(rbicf, d, label, z, x, lra);
-      Vec dx = computeDeltaX(rbicf, d, label, dnu, lra, z);
-
-      workspace.replace(workspace.find("dx"), dx);
+      computeDeltaX(rbicf, d, label, dnu, lra, z, dx);
       
       LineSearchTask lst = new LineSearchTask(c_pos, c_neg).doAll(workspace);
 
@@ -65,6 +65,8 @@ public class PrimalDualIPM {
               "Please consider changing the convergence parameters or increase the maximum number of iterations (" + params._max_iter + ").");
     }
 
+    volatileWorkspace.remove();
+    
     return x;
   }
 
@@ -343,7 +345,7 @@ public class PrimalDualIPM {
     }
   }
 
-  private static Vec computeDeltaX(Frame icf, Vec d, Vec label, final double dnu, LLMatrix lra, Vec z) {
+  private static void computeDeltaX(Frame icf, Vec d, Vec label, final double dnu, LLMatrix lra, Vec z, Vec dx) {
     Vec tz = new MRTask() {
       @Override
       public void map(Chunk z, Chunk label, NewChunk tz) {
@@ -352,14 +354,25 @@ public class PrimalDualIPM {
         }
       }
     }.doAll(Vec.T_NUM, z, label).outputFrame().anyVec();
-    return linearSolveViaICFCol(icf, d, tz, lra);
+    try {
+      linearSolveViaICFCol(icf, d, tz, lra, dx);
+    } finally {
+      tz.remove(); // TODO: avoid calculating the `tz`
+    }
   }
   
   private static double computeDeltaNu(Frame icf, Vec d, Vec label, Vec z, Vec x, LLMatrix lra) {
-    Vec tw = linearSolveViaICFCol(icf, d, z, lra);
-    Vec tl = linearSolveViaICFCol(icf, d, label, lra);
-    DeltaNuTask dnt = new DeltaNuTask().doAll(label, tw, tl, x);
-    return dnt._sum1 / dnt._sum2;
+    Vec tw = label.makeVolatileDoubles(1)[0];  // TODO: do not allocate temporary vecs
+    Vec tl = label.makeVolatileDoubles(1)[0];
+    try {
+      linearSolveViaICFCol(icf, d, z, lra, tw);
+      linearSolveViaICFCol(icf, d, label, lra, tl);
+      DeltaNuTask dnt = new DeltaNuTask().doAll(label, tw, tl, x);
+      return dnt._sum1 / dnt._sum2;
+    } finally {
+      tw.remove();
+      tl.remove();
+    }
   }
   
   static class DeltaNuTask extends MRTask<DeltaNuTask> {
@@ -385,11 +398,9 @@ public class PrimalDualIPM {
     }
   }
   
-  private static Vec linearSolveViaICFCol(Frame icf, Vec d, Vec b, LLMatrix lra) {
-    LSHelper1 lsh = new LSHelper1().doAll(Vec.T_NUM, ArrayUtils.append(icf.vecs(), d, b));
-    Vec x = lsh.outputFrame().anyVec();
-    final double[] vz = lsh._row;
-    double[] ty = new double[vz.length];
+  private static void linearSolveViaICFCol(Frame icf, Vec d, Vec b, LLMatrix lra, Vec out) {
+    final double[] vz = new LSHelper1().doAll(ArrayUtils.append(icf.vecs(), d, b, out))._row;
+    final double[] ty = new double[vz.length];
     MatrixUtils.cholForwardSub(lra, vz, ty);
     MatrixUtils.cholBackwardSub(lra, ty, vz);
     new MRTask() {
@@ -406,19 +417,18 @@ public class PrimalDualIPM {
           x.set(i, x.atd(i) - s);
         }
       }
-    }.doAll(ArrayUtils.append(icf.vecs(), d, x));
-    return x;
+    }.doAll(ArrayUtils.append(icf.vecs(), d, out));
   }
 
   static class LSHelper1 extends MRTask<LSHelper1> {
     double[] _row;
     @Override
-    public void map(Chunk[] cs, NewChunk nc) {
-      final int p = cs.length - 2;
+    public void map(Chunk[] cs) {
+      final int p = cs.length - 3;
       _row = new double[p];
       Chunk d = cs[p];
       Chunk b = cs[p + 1];
-      double[] z = new double[cs[0]._len];
+      double[] z = ((C8DVolatileChunk) cs[p + 2]).getValues();
       for (int i = 0; i < z.length; i++) {
         z[i] = b.atd(i) * d.atd(i);
       }
@@ -428,9 +438,6 @@ public class PrimalDualIPM {
           s += cs[j].atd(i) * z[i];
         }
         _row[j] = s;
-      }
-      for (double zi : z) {
-        nc.addNum(zi);
       }
     }
 
