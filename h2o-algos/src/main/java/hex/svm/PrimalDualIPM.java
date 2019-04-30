@@ -9,8 +9,8 @@ import water.util.ArrayUtils;
 import water.util.Log;
 
 public class PrimalDualIPM {
-  
-  static void solve(Frame rbicf, Vec label, Params params) {
+
+  static Vec solve(Frame rbicf, Vec label, Params params) {
     checkLabel(label);
 
     final double c_pos = params._weight_positive * params._hyper_parm;
@@ -23,7 +23,7 @@ public class PrimalDualIPM {
     Vec xi = initFrame.vec(1);
 
     double nu = 0;
-    
+    boolean converged = false;
     for (int iter = 0; iter < params._max_iter; iter++) {
       double eta = computeSurrogateGap(c_pos, c_neg, label, x, la, xi);
       double t = (params._mu_factor * num_constraints) / eta;
@@ -31,11 +31,11 @@ public class PrimalDualIPM {
 
       Vec z = computePartialZ(rbicf, x, params._tradeoff);
       CheckConvergenceTask cct = new CheckConvergenceTask(nu).doAll(z, label, la, x, xi);
-      if (cct._resp <= params._feasible_threshold && cct._resd <= params._feasible_threshold 
-              && eta <= params._sgap_bound) {
+      converged = cct._resp <= params._feasible_threshold && cct._resd <= params._feasible_threshold && eta <= params._sgap_bound;
+      if (converged) {
         break;
       }
-      
+
       Frame working = new UpdateVarsTask(c_pos, c_neg, params._x_epsilon, t)
               .doAll(new byte[]{Vec.T_NUM, Vec.T_NUM, Vec.T_NUM, Vec.T_NUM, Vec.T_NUM}, z, label, la, x, xi)
               .outputFrame(new String[]{"tlx", "tux", "xilx", "laux", "d"}, null); 
@@ -53,6 +53,13 @@ public class PrimalDualIPM {
 
       nu += lst._ad * dnu;
     }
+
+    if (! converged) {
+      Log.warn("The algorithm didn't converge in the maximum number of iterations. " +
+              "Please consider changing the convergence parameters or increase the maximum number of iterations (" + params._max_iter + ").");
+    }
+
+    return x;
   }
 
   static class MakeStepTask extends MRTask<MakeStepTask> {
