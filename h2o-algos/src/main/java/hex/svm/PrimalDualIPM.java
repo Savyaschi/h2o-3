@@ -5,22 +5,26 @@ import water.fvec.*;
 import water.util.ArrayUtils;
 import water.util.Log;
 
-public class PrimalDualIPM {
+class PrimalDualIPM {
 
   static Vec solve(Frame rbicf, Vec label, Params params) {
     checkLabel(label);
 
-    final double c_pos = params._weight_positive * params._hyper_parm;
-    final double c_neg = params._weight_negative * params._hyper_parm;
-    final long num_constraints = rbicf.numRows() * 2;
+    Frame volatileWorkspace = makeVolatileWorkspace(label,
+            "z", "xi", "dxi", "la", "dla", "tlx", "tux", "xilx", "laux", "d", "dx");
+    try {
+      return solve(rbicf, label, params, volatileWorkspace);
+    } finally {
+      volatileWorkspace.remove();
+    }
+  }
 
-    Frame volatileWorkspace = new Frame(new String[]{"z", "xi", "dxi", "la", "dla", "tlx", "tux", "xilx", "laux", "d", "dx"}, label.makeVolatileDoubles(11));
-
+  static Vec solve(Frame rbicf, Vec label, Params params, Frame volatileWorkspace) {
     Frame workspace = new Frame(new String[]{"label"}, new Vec[]{label});
     workspace.add("x", label.makeZero());
     workspace.add(volatileWorkspace);
-
-    new InitTask(c_pos, c_neg).doAll(workspace);
+    
+    new InitTask(params).doAll(workspace);
 
     Vec z = workspace.vec("z");
     Vec la = workspace.vec("la");
@@ -33,27 +37,28 @@ public class PrimalDualIPM {
 
     double nu = 0;
     boolean converged = false;
+    final long num_constraints = rbicf.numRows() * 2;
     for (int iter = 0; iter < params._max_iter; iter++) {
-      final double eta = new SurrogateGapTask(c_pos, c_neg).doAll(workspace)._sum;
+      final double eta = new SurrogateGapTask(params).doAll(workspace)._sum;
       final double t = (params._mu_factor * num_constraints) / eta;
       Log.debug("sgap: " + eta + " t: " + t);
 
       computePartialZ(rbicf, x, params._tradeoff, z);
-      CheckConvergenceTask cct = new CheckConvergenceTask(nu).doAll(workspace);
+      CheckConvergenceTask cct = new CheckConvergenceTask(params, nu).doAll(workspace);
       converged = cct._resp <= params._feasible_threshold && cct._resd <= params._feasible_threshold && eta <= params._sgap_bound;
       if (converged) {
         break;
       }
 
-      new UpdateVarsTask(c_pos, c_neg, params._x_epsilon, t).doAll(workspace);
+      new UpdateVarsTask(params, t).doAll(workspace);
 
       LLMatrix icfA = MatrixUtils.productMM(rbicf, d);
-      LLMatrix lra = MatrixUtils.cf(icfA);
+      LLMatrix lra = icfA.cf();
 
       final double dnu = computeDeltaNu(rbicf, d, label, z, x, lra);
       computeDeltaX(rbicf, d, label, dnu, lra, z, dx);
       
-      LineSearchTask lst = new LineSearchTask(c_pos, c_neg).doAll(workspace);
+      LineSearchTask lst = new LineSearchTask(params).doAll(workspace);
 
       new MakeStepTask(lst._ap, lst._ad).doAll(x, dx, xi, dxi, la, dla);
 
@@ -71,11 +76,20 @@ public class PrimalDualIPM {
   }
 
   private static abstract class PDIPMTask<E extends PDIPMTask<E>> extends MRTask<E> {
-    Chunk _label, _x;
-    Chunk _z;
-    Chunk _xi, _dxi, _la, _dla;
-    Chunk _tlx, _tux, _xilx, _laux, _d;
-    Chunk _dx;
+    transient Chunk _label, _x;
+    transient Chunk _z;
+    transient Chunk _xi, _dxi, _la, _dla;
+    transient Chunk _tlx, _tux, _xilx, _laux, _d;
+    transient Chunk _dx;
+
+    final double _c_pos;
+    final double _c_neg;
+
+    PDIPMTask(Params params) {
+      _c_pos = params._weight_positive * params._hyper_parm;
+      _c_neg = params._weight_negative * params._hyper_parm;
+    }
+
     @Override
     public void map(Chunk[] cs) {
       _label = cs[0];
@@ -120,17 +134,14 @@ public class PrimalDualIPM {
     }
     
   }
-
+  
   static class LineSearchTask extends PDIPMTask<LineSearchTask> {
-    private final double _c_pos;
-    private final double _c_neg;
-
+    // OUT
     private double _ap;
     private double _ad;
     
-    LineSearchTask(double c_pos, double c_neg) {
-      _c_pos = c_pos;
-      _c_neg = c_neg;
+    LineSearchTask(Params params) {
+      super(params);
     }
 
     @Override
@@ -183,15 +194,12 @@ public class PrimalDualIPM {
   }
   
   static class UpdateVarsTask extends PDIPMTask<UpdateVarsTask> {
-    private final double _c_pos;
-    private final double _c_neg;
     private final double _epsilon_x;
     private final double _t;
 
-    UpdateVarsTask(double c_pos, double c_neg, double epsilon_x, double t) {
-      _c_pos = c_pos;
-      _c_neg = c_neg;
-      _epsilon_x = epsilon_x;
+    UpdateVarsTask(Params params, double t) {
+      super(params);
+      _epsilon_x = params._x_epsilon;
       _t = t;
     }
     
@@ -223,7 +231,8 @@ public class PrimalDualIPM {
     double _resd;
     double _resp;
 
-    CheckConvergenceTask(double nu) {
+    CheckConvergenceTask(Params params, double nu) {
+      super(params);
       _nu = nu;
     }
 
@@ -271,7 +280,7 @@ public class PrimalDualIPM {
       }
     }.doAll(ArrayUtils.append(vecs, z));
   }
-  
+
   static class MatrixMultVecTask extends MRTask<MatrixMultVecTask> {
     double[] _row;
 
@@ -296,15 +305,11 @@ public class PrimalDualIPM {
   }
 
   static class SurrogateGapTask extends PDIPMTask<SurrogateGapTask> {
-    private final double _c_pos;
-    private final double _c_neg;
-    
     // OUT
     private double _sum;
 
-    SurrogateGapTask(double c_pos, double c_neg) {
-      _c_pos = c_pos;
-      _c_neg = c_neg;
+    SurrogateGapTask(Params params) {
+      super(params);
     }
     
     @Override
@@ -327,12 +332,8 @@ public class PrimalDualIPM {
   }
   
   static class InitTask extends PDIPMTask<InitTask> {
-    private final double _c_pos;
-    private final double _c_neg;
-
-    InitTask(double c_pos, double c_neg) {
-      _c_pos = c_pos;
-      _c_neg = c_neg;
+    InitTask(Params params) {
+      super(params);
     }
 
     @Override
@@ -409,17 +410,12 @@ public class PrimalDualIPM {
 
   private static double[] partialLinearSolveViaICFCol(Frame icf, Vec d, Vec b, LLMatrix lra) {
     final double[] vz = new LSHelper1(false).doAll(ArrayUtils.append(icf.vecs(), d, b))._row;
-    final double[] ty = new double[vz.length];
-    MatrixUtils.cholForwardSub(lra, vz, ty);
-    MatrixUtils.cholBackwardSub(lra, ty, vz);
-    return vz;
+    return lra.cholSolve(vz);
   }
   
   private static void linearSolveViaICFCol(Frame icf, Vec d, Vec b, LLMatrix lra, Vec out) {
-    final double[] vz = new LSHelper1(true).doAll(ArrayUtils.append(icf.vecs(), d, b, out))._row;
-    final double[] ty = new double[vz.length];
-    MatrixUtils.cholForwardSub(lra, vz, ty);
-    MatrixUtils.cholBackwardSub(lra, ty, vz);
+    final double tmp[] = new LSHelper1(true).doAll(ArrayUtils.append(icf.vecs(), d, b, out))._row;
+    final double[] vz = lra.cholSolve(tmp);
     new MRTask() {
       @Override
       public void map(Chunk[] cs) {
@@ -483,6 +479,9 @@ public class PrimalDualIPM {
     double _sgap_bound = 1.0e-3;
     double _x_epsilon = 1.0e-9;
   }
-  
+
+  private static Frame makeVolatileWorkspace(Vec blueprintVec, String... names) {
+    return new Frame(names, blueprintVec.makeVolatileDoubles(names.length));
+  }
     
 }
