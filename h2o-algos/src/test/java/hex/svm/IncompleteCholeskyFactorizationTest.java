@@ -48,9 +48,6 @@ public class IncompleteCholeskyFactorizationTest extends TestUtil  {
     public void run() {
       Kernel kernel = new GaussianKernel(0.01);
       _icf = IncompleteCholeskyFactorization.icf(_fr, "C1", kernel, 3, 1e-6);
-      
-      PrimalDualIPM.solve(_icf, _fr.vec("C1"), new PrimalDualIPM.Params());
-      
     }
   }
   
